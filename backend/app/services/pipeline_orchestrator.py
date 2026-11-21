@@ -12,8 +12,11 @@ from typing import Any
 from app.fixtures import (
     SOURCE_EVENTS, TRANSFORM_RECORDS, WINDOW_CONFIGS,
     RULE_TRIGGERS, METRIC_DEFS, QUALITY_SAMPLES,
-    PARTITION_STATS, EVENT_ROUTES,
+    PARTITION_STATS, PARTITION_CAPACITY, PARTITION_KEY_RANGES,
+    PARTITION_INFLIGHT, PARTITION_DELIVERED, PARTITION_INCOMING,
+    EVENT_ROUTES,
 )
+from app.services.partition_migration import evaluate_migration_plan
 from app.store import store
 
 
@@ -170,20 +173,65 @@ def run_quality_scan() -> dict:
 
 
 # Pipeline 6: grp_partition -> backpressure
-def run_partition_backpressure_pipeline() -> dict:
-    """分区统计与背压评估。"""
-    stats = list(PARTITION_STATS)
-    bp_alerts = []
-    for s in stats:
-        vals = [_to_float(s[f"分区{i}行数"]) for i in range(int(s["分区数量"]))]
-        if vals:
-            mx = max(vals)
-            mn = min(vals)
-            skew = (mx - mn) / statistics.mean(vals) if statistics.mean(vals) > 0 else 0.0
-            if skew > 1.0 or s.get("再平衡建议"):
-                bp_alerts.append({"分区键": s["分区键"], "歪斜度": round(skew, 2), "热点": s["热点分区"], "建议": "触发再平衡"})
+def _capacity_manifest_rows() -> list[dict]:
+    """容量清单：背压控制消费待迁移行范围后，把迁移结论回写到这里。"""
+    return store.rows("_capacity_manifest")
 
-    result = {"partition_count": len(stats), "backpressure_alerts": bp_alerts, "alert_count": len(bp_alerts)}
+
+def _write_capacity_manifest(updates: list[dict]) -> None:
+    rows = _capacity_manifest_rows()
+    for upd in updates:
+        for row in rows:
+            if row.get("分区键") == upd.get("分区键") and row.get("分区") == upd.get("分区"):
+                row.update(upd)
+                row["更新时间"] = datetime.now().isoformat()
+                break
+        else:
+            rows.append({**upd, "更新时间": datetime.now().isoformat()})
+
+
+def run_partition_backpressure_pipeline() -> dict:
+    """分区统计与背压评估：在再平衡建议之上给出可执行的迁移评估。
+
+    对每个分区键：按分区上限与已有分区键范围算出待迁移行范围，
+    核对在途记录（源位点只接纳一次），检测迁移时机冲突，
+    迁移确认后才发放额度并把结论回写容量清单。
+    """
+    stats = list(PARTITION_STATS)
+    bp_alerts: list[dict] = []
+    plans: list[dict] = []
+    for idx, s in enumerate(stats):
+        key = str(s.get("分区键", ""))
+        capacity = next((c for c in PARTITION_CAPACITY if c["分区键"] == key), {})
+        fetch_call = f"FETCH-{key}-{idx + 1:04d}"
+        plan = evaluate_migration_plan(
+            stat=s,
+            capacity=capacity,
+            key_ranges=PARTITION_KEY_RANGES,
+            inflight=PARTITION_INFLIGHT,
+            delivered=PARTITION_DELIVERED,
+            incoming=PARTITION_INCOMING,
+            fetch_call=fetch_call,
+        )
+        plans.append(plan)
+        if plan["歪斜度"] > 1.0 or s.get("再平衡建议"):
+            bp_alerts.append({
+                "分区键": key, "歪斜度": plan["歪斜度"],
+                "热点": plan["热点分区"], "建议": "触发再平衡",
+            })
+        # 背压控制消费待迁移行范围，迁移结论回写容量清单
+        if plan["额度"]["状态"] == "已发放":
+            _write_capacity_manifest(plan["容量回写"])
+
+    result = {
+        "partition_count": len(stats),
+        "backpressure_alerts": bp_alerts,
+        "alert_count": len(bp_alerts),
+        "migration_plans": plans,
+        "pending_migration_rows": sum(p["待迁移行范围"]["行数"] for p in plans),
+        "quota_granted_rows": sum(p["额度"]["额度行数"] for p in plans),
+        "capacity_manifest": [dict(r) for r in _capacity_manifest_rows()],
+    }
     _wr("partition_backpressure", {"source": ["grp_partition"], "target": "backpressure", "payload": result})
     return result
 
